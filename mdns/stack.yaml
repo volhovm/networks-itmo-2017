@@ -1,0 +1,7 @@
+resolver: lts-8.2
+packages:
+- '.'
+nix:
+  packages: [binutils]
+extra-deps: 
+- universum-0.2.1
