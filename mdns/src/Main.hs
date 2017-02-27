@@ -2,5 +2,10 @@ module Main where
 
 import           Universum
 
+import           Options   (getOptions)
+
+
 main :: IO ()
-main = putText "TODO"
+main = do
+    o <- getOptions
+    putText $ "Launched with opts: " <> show o
