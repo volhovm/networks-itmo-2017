@@ -9,7 +9,7 @@ import           Options.Applicative.Simple (CommandFields, Mod, Parser, auto, c
                                              strOption, subparser, value)
 import           Universum
 
-import           Paths_mdns                 (version)
+import           Paths_ymdns                (version)
 
 data Action
     = YMServe { port     :: Int
