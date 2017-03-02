@@ -1,7 +1,11 @@
 {-# LANGUAGE TemplateHaskell #-}
 -- | Options parsing from CLI
 
-module Options where
+module Options
+       ( Action (..)
+       , Opts (..)
+       , getOptions
+       ) where
 
 import           Options.Applicative.Simple (CommandFields, Mod, Parser, auto, command,
                                              help, info, long, metavar, option, progDesc,

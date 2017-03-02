@@ -18,6 +18,19 @@ newtype Hostname = Hostname
     { getHostname :: String
     } deriving (Show)
 
+checkHostnameChar :: (MonadFail m) => Word8 -> m ()
+checkHostnameChar c =
+    unless ((c >= 97 && c <= 122) || c == 46) $
+        fail $ "Hostname character not in range [(a..z)|.]: '" <>
+               [chr $ fromIntegral c] <> "'"
+
+createHostname :: (MonadFail m) => String -> m Hostname
+createHostname s = do
+    when (length s > 256) $
+        fail "Hostname shouldn't be more than 256 elements long"
+    mapM_ s checkHostnameChar
+    pure $ Hostname s
+
 -- | Resolve map from hostname to ip.
 newtype ResolveMap = ResolveMap
     { getResolveMap :: [(Hostname, Int32)]
@@ -35,11 +48,6 @@ data YMDnsMsg
 -- Binary serialization
 ----------------------------------------------------------------------------
 
-checkHostnameChar :: (MonadFail m) => Word8 -> m ()
-checkHostnameChar c =
-    unless ((c >= 97 && c <= 122) || c == 46) $
-        fail $ "Hostname character not in range [(a..z)|.]: '" <>
-               [chr $ fromIntegral c] <> "'"
 
 instance Store Hostname where
     size = VarSize $ \(Hostname s) -> length s + 1
@@ -70,3 +78,24 @@ instance Store ResolveMap where
         (l :: Word8) <- peek
         fmap ResolveMap . replicateM (fromIntegral l) $
             (,) <$> peek <*> peek
+
+----------------------------------------------------------------------------
+-- Worker, server part
+----------------------------------------------------------------------------
+
+data YMDnsState = YMDnsState
+    { neighborsAddress :: Map Hostname (
+    , ourHostname :: Hostname
+    }
+
+initYMDns :: Hostname -> YMDnsState
+initYMDns = undefined
+
+-- | YMDns server, blocks.
+resolveWorker :: Hostname -> IO ()
+resolveWorker = action `catch` handler
+  where
+    handler (e :: SomeException) = do
+        putText $ "Exception happened in resolveWorker: " <> show e
+        action `catch` handler
+    action = do
