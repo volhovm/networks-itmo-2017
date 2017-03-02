@@ -1,11 +1,10 @@
 {-# LANGUAGE ScopedTypeVariables #-}
--- | File sharing server/client code.
 
-module FileSharing where
+-- | File sharing server code.
+module FileSharing
+    ( runReportServer
+    ) where
 
-import           Control.Concurrent                   (forkIO)
-import           Control.Concurrent.STM               (TVar, newTVarIO, readTVar,
-                                                       writeTVar)
 import qualified Data.Text                            as T
 import qualified Data.Text.Lazy                       as TL
 import           Network.HTTP.Types.Status            (status200, status404)
@@ -16,12 +15,8 @@ import           System.Directory                     (createDirectoryIfMissing,
 import           System.FilePath                      (takeFileName)
 import           Universum
 import           Web.Scotty                           (ScottyM, file, get, notFound,
-                                                       param, post, regex, scottyApp,
-                                                       status, text)
-
-----------------------------------------------------------------------------
--- Server part
-----------------------------------------------------------------------------
+                                                       param, regex, scottyApp, status,
+                                                       text)
 
 retrieveFiles :: FilePath -> IO [FilePath]
 retrieveFiles dir = listDirectory dir >>= filterM doesFileExist
@@ -34,10 +29,11 @@ runReportServer port startDir = do
 
 fileSharingApp :: FilePath -> ScottyM ()
 fileSharingApp dir = do
-    post "/list" $ do
+    get "/list" $ do
         available <- liftIO $ retrieveFiles dir
         text $ TL.fromStrict $
             T.intercalate "\n" $ map (T.pack . takeFileName) available
+        status status200
     get (regex "^/download/(.*)$") $ do
         (filename :: FilePath) <- param "1"
         exists <- liftIO $ do

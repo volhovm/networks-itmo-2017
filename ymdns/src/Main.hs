@@ -1,16 +1,15 @@
 module Main where
 
-import           Data.Store  (Store (..), encode)
 import           Universum
 
-import           FileSharing
-import           Options
+import           FileSharing (runReportServer)
+import           Options     (Action (..), Opts (..), getOptions)
 import           Resolving
 
 main :: IO ()
 main = do
-    o <- getOptions
+    o@Opts{..} <- getOptions
     putText $ "Launched with opts: " <> show o
-    case action o of
-        YMRequest req -> sendRequest req >> waitForResponse >>= downloadFile
+    case action of
         YMServe {..}  -> serveProducer hostname >> runReportServer port filesDir
+        YMRequest req -> sendRequest req >> waitForResponse >>= downloadFile
