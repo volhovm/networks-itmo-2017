@@ -12,7 +12,7 @@ import           Network.HTTP.Types.Status            (status200, status404)
 import qualified Network.Wai.Handler.Warp             as Warp
 import           Network.Wai.Middleware.RequestLogger (logStdoutDev)
 import           System.Directory                     (createDirectoryIfMissing,
-                                                       listDirectory)
+                                                       doesFileExist, listDirectory)
 import           System.FilePath                      (takeFileName)
 import           Universum
 import           Web.Scotty                           (ScottyM, file, get, notFound,
@@ -23,33 +23,25 @@ import           Web.Scotty                           (ScottyM, file, get, notFo
 -- Server part
 ----------------------------------------------------------------------------
 
-fileRetrievalWorker :: FilePath -> TVar [FilePath] -> IO ()
-fileRetrievalWorker fp var = action `catch` handler
-  where
-    action = forever $ do
-        createDirectoryIfMissing True fp
-        atomically . writeTVar var =<< listDirectory fp
-    handler (e :: SomeException) = do
-        putText $ "Got error in fileRetrievalWorker: " <> show e
-        action `catch` handler
+retrieveFiles :: FilePath -> IO [FilePath]
+retrieveFiles dir = listDirectory dir >>= filterM doesFileExist
 
 runReportServer :: Int -> FilePath -> IO ()
 runReportServer port startDir = do
-    var <- newTVarIO []
-    void $ forkIO $ fileRetrievalWorker startDir var
-    application <- scottyApp $ fileSharingApp var
+    createDirectoryIfMissing True startDir
+    application <- scottyApp $ fileSharingApp startDir
     Warp.run port $ logStdoutDev  application
 
-fileSharingApp :: TVar [FilePath] -> ScottyM ()
-fileSharingApp var = do
+fileSharingApp :: FilePath -> ScottyM ()
+fileSharingApp dir = do
     post "/list" $ do
-        available <- atomically $ readTVar var
+        available <- liftIO $ retrieveFiles dir
         text $ TL.fromStrict $
             T.intercalate "\n" $ map (T.pack . takeFileName) available
     get (regex "^/download/(.*)$") $ do
         (filename :: FilePath) <- param "1"
-        exists <- atomically $ do
-            allPaths <- readTVar var
+        exists <- liftIO $ do
+            allPaths <- retrieveFiles dir
             pure $ find ((filename ==) . takeFileName) allPaths
         maybe (status status404) (\x -> file x >> status status200) exists
     notFound err404
