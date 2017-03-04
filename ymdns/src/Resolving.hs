@@ -82,7 +82,7 @@ instance Store ResolveMap where
     poke (ResolveMap xs) = do
         when (length xs > 256) $
             fail "Resolve map length shouldn't be more than 256 elements long"
-        poke (fromIntegral (length xs) :: Word)
+        poke (fromIntegral (length xs) :: Word8)
         forM_ xs $ \(h,ip) -> poke h >> poke ip
     peek = do
         (l :: Word8) <- peek
