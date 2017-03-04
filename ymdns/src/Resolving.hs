@@ -26,8 +26,12 @@ newtype Hostname = Hostname
 
 checkHostnameChar :: (MonadFail m) => Word8 -> m ()
 checkHostnameChar c =
-    unless ((c >= 97 && c <= 122) || c == 46) $
-        fail $ "Hostname character not in range [(a..z)|.]: '" <>
+    unless (or
+            [ c >= BS.c2w 'a' && c <= BS.c2w 'z'
+            , c >= BS.c2w '0' && c <= BS.c2w '9'
+            , c == BS.c2w '.'
+            ]) $
+        fail $ "Hostname character not in range [(a..z)|(0..9)|.]: '" <>
                [chr $ fromIntegral c] <> "'"
 
 createHostname :: (MonadFail m) => String -> m Hostname
