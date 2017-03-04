@@ -43,6 +43,7 @@ data YMDnsMsg
     | YMDnsRequest { ymdReq :: Hostname}
     | YMDnsResponse { ymdResp :: ResolveMap }
     | YMDnsHeartbeat
+    deriving (Show)
 
 ----------------------------------------------------------------------------
 -- Binary serialization
