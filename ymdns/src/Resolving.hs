@@ -133,9 +133,11 @@ resolveWorker host = producerAction host `catch` handler
 producerAction :: Hostname -> IO ()
 producerAction host = withSocketsDo $ do
     sock <- multicastReceiver multicastHost multicastPort
+    addr <- SockAddrInet multicastPort <$> inet_addr multicastHost
+    sendMsgTo sock addr $ YMDnsJoin host
     let loop = do
-            (msg, addr) <- recvFrom sock 65536
-            print (msg, addr)
+            (msg, addr') <- recvFrom sock 65536
+            print (msg, addr')
     loop
 
 -- | Function for spawning a producer in another thread
