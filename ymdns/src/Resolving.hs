@@ -6,8 +6,14 @@
 
 module Resolving where
 
-import           Data.Store (Size (..), Store (..))
-import           Universum  hiding (ByteString)
+import           Control.Concurrent        (forkIO)
+import qualified Data.ByteString           as BS
+import qualified Data.ByteString.Internal  as BS (c2w)
+import           Data.Store                (Size (..), Store (..), encode)
+import           Network.Multicast
+import           Network.Socket            hiding (recv, recvFrom, send, sendTo)
+import           Network.Socket.ByteString
+import           Universum                 hiding (ByteString)
 
 ----------------------------------------------------------------------------
 -- Network message types
@@ -28,13 +34,13 @@ createHostname :: (MonadFail m) => String -> m Hostname
 createHostname s = do
     when (length s > 256) $
         fail "Hostname shouldn't be more than 256 elements long"
-    mapM_ s checkHostnameChar
+    mapM_ (checkHostnameChar . BS.c2w) s
     pure $ Hostname s
 
 -- | Resolve map from hostname to ip.
 newtype ResolveMap = ResolveMap
     { getResolveMap :: [(Hostname, Int32)]
-    } deriving (Show)
+    } deriving (Show, Generic)
 
 -- | YMDns message type
 data YMDnsMsg
@@ -43,12 +49,11 @@ data YMDnsMsg
     | YMDnsRequest { ymdReq :: Hostname}
     | YMDnsResponse { ymdResp :: ResolveMap }
     | YMDnsHeartbeat
-    deriving (Show)
+    deriving (Show, Generic)
 
 ----------------------------------------------------------------------------
 -- Binary serialization
 ----------------------------------------------------------------------------
-
 
 instance Store Hostname where
     size = VarSize $ \(Hostname s) -> length s + 1
@@ -80,13 +85,38 @@ instance Store ResolveMap where
         fmap ResolveMap . replicateM (fromIntegral l) $
             (,) <$> peek <*> peek
 
+-- Using generics here s licom mrazi
+instance Store YMDnsMsg
+
+----------------------------------------------------------------------------
+-- Protocol constants
+----------------------------------------------------------------------------
+
+multicastHost :: HostName
+multicastHost = "224.0.0.250"
+
+multicastPort :: PortNumber
+multicastPort = 5565
+
+----------------------------------------------------------------------------
+-- Protocol helpers
+----------------------------------------------------------------------------
+
+sendMsgTo :: Store msg => Socket -> SockAddr -> msg -> IO ()
+sendMsgTo sock addr msg = do
+    let bs = encode msg
+        len = BS.length bs
+    n <- sendTo sock bs addr
+    when (n /= len) $
+        fail "Couldn't send an msg via one package"
+
 ----------------------------------------------------------------------------
 -- Worker, server part
 ----------------------------------------------------------------------------
 
 data YMDnsState = YMDnsState
-    { neighborsAddress :: Map Hostname (
-    , ourHostname :: Hostname
+    { neighborsAddress :: Map Hostname HostName
+    , ourHostname      :: Hostname
     }
 
 initYMDns :: Hostname -> YMDnsState
@@ -94,9 +124,37 @@ initYMDns = undefined
 
 -- | YMDns server, blocks.
 resolveWorker :: Hostname -> IO ()
-resolveWorker = action `catch` handler
+resolveWorker host = producerAction host `catch` handler
   where
     handler (e :: SomeException) = do
         putText $ "Exception happened in resolveWorker: " <> show e
-        action `catch` handler
-    action = do
+        resolveWorker host
+
+producerAction :: Hostname -> IO ()
+producerAction host = withSocketsDo $ do
+    sock <- multicastReceiver multicastHost multicastPort
+    let loop = do
+            (msg, addr) <- recvFrom sock 65536
+            print (msg, addr)
+    loop
+
+-- | Function for spawning a producer in another thread
+serveProducer :: String -> IO ()
+serveProducer host = void $ forkIO $ resolveWorker $ Hostname host
+
+-----------------------------------------------------------------------------
+-- Worker, client part
+-----------------------------------------------------------------------------
+
+sendRequest :: String -> IO ()
+sendRequest host = withSocketsDo $ do
+    (sock, addr) <- multicastSender multicastHost multicastPort
+    let msg = YMDnsRequest $ Hostname host
+    sendMsgTo sock addr msg
+
+-- TODO: how to do it nicely?
+waitForResponse :: IO ResolveMap
+waitForResponse = return $ ResolveMap []
+
+downloadFile :: ResolveMap -> IO ()
+downloadFile _ = putText "Haha, loh, failov net"
