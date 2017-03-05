@@ -218,7 +218,7 @@ data YMDnsConfig = YMDnsConfig
   }
 
 data YMDnsState = YMDnsState
-  { _lResolveMap           :: ResolveMap
+  { _lResolveMap      :: ResolveMap
   , _lHeartbeatTimers :: M.Map InetAddress Delay
   }
 
