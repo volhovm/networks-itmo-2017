@@ -20,7 +20,11 @@ main = do
                           parseURI requestString
                 host = uriRegName $ fromMaybe (panic "Couldn't get host") $
                                     uriAuthority uri
-            host' <- pure host -- resolve here
+
+            host' <- resolveHost (Hostname host) >>= \case
+                Nothing -> fail "host not found"
+                Just (InetAddress addr _port) -> return $ showHostAddress addr
+
             -- NETWORK.URI
             -- USE
             -- LENS

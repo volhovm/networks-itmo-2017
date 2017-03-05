@@ -20,6 +20,7 @@ executable ymdns-cli
                      , containers
                      , directory >= 1.3.0.0
                      , filepath >= 1.4.1.1
+                     , hashable
                      , http-types >= 0.9.1
                      , lens
                      , network

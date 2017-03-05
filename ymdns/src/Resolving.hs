@@ -14,13 +14,18 @@ import           Control.Concurrent.STM.Delay (Delay, newDelay, updateDelay, wai
 import           Control.Lens                 (makeLenses, (%=))
 import qualified Data.ByteString              as BS
 import qualified Data.ByteString.Internal     as BS (c2w)
+import           Data.Hashable                (hash)
+import           Data.List                    (lookup)
 import qualified Data.Map.Strict              as M
 import           Data.Store                   (Size (..), Store (..), decode, encode)
 import qualified GHC.Show                     (show)
 import           Network.BSD                  (getProtocolNumber)
 import           Network.Multicast            (multicastReceiver)
-import           Network.Socket               hiding (recv, recvFrom, send, sendTo)
-import           Network.Socket.ByteString
+import           Network.Socket               (Family (AF_INET), SockAddr (SockAddrInet),
+                                               Socket, SocketType (Datagram),
+                                               hostAddressToTuple, socket,
+                                               tupleToHostAddress, withSocketsDo)
+import           Network.Socket.ByteString    (recvFrom, sendTo)
 import           System.Timeout               (timeout)
 import           Universum                    hiding (ByteString)
 
@@ -31,7 +36,7 @@ import           Universum                    hiding (ByteString)
 -- | Hostname we can reserve. Should be <256 chars, ascii low-letters only.
 newtype Hostname = Hostname
     { getHostname :: String
-    } deriving (Show)
+    } deriving (Show, Eq, Hashable)
 
 checkHostnameChar :: (MonadFail m) => Word8 -> m ()
 checkHostnameChar c =
@@ -56,12 +61,11 @@ data InetAddress = InetAddress
     , ia_port    :: Word16
     } deriving (Eq, Ord)
 
+showHostAddress :: Word32 -> String
+showHostAddress addr = hostAddressToTuple addr & \(a,b,c,d) -> intercalate "." (map show [a,b,c,d])
+
 instance Show InetAddress where
-    show (InetAddress addr port) = concat
-        [ hostAddressToTuple addr & \(a,b,c,d) -> intercalate "." (map show [a,b,c,d])
-        , ":"
-        , show port
-        ]
+    show (InetAddress addr port) = showHostAddress addr <> ":" <> show port
 
 inetAddressToSockAddr :: InetAddress -> SockAddr
 inetAddressToSockAddr (InetAddress addr port) = SockAddrInet (fromIntegral port) addr
@@ -92,6 +96,17 @@ adaptResolveMap myHostname senderAddress (ResolveMap senderHost other)
 resolveMapRemove :: InetAddress -> ResolveMap -> ResolveMap
 resolveMapRemove address (ResolveMap oh other)
     = ResolveMap oh $ filter (\(_host, address') -> address' /= address) other
+data ResolveResult
+    = NotFound
+    | Owner
+    | Found InetAddress
+    deriving (Show, Generic)
+
+resolve :: ResolveMap -> Hostname -> ResolveResult
+resolve (ResolveMap ownerHost _) reqHost | ownerHost == reqHost = Owner
+resolve (ResolveMap _ other) reqHost = case lookup reqHost other of
+    Nothing   -> NotFound
+    Just addr -> Found addr
 
 
 -- | YMDns message type
@@ -99,7 +114,7 @@ data YMDnsMsg
     = YMDnsJoin { ymdJoinHostname :: Hostname}
     | YMDnsShare { ymdShared :: ResolveMap }
     | YMDnsRequest { ymdReq :: Hostname}
-    | YMDnsResponse { ymdResp :: ResolveMap }
+    | YMDnsResponse { ymdResp :: ResolveResult }
     | YMDnsHeartbeat
     deriving (Show, Generic)
 
@@ -145,6 +160,7 @@ instance Store ResolveMap where
             (,) <$> peek <*> peek
 
 -- Using generics here s licom mrazi
+instance Store ResolveResult
 instance Store YMDnsMsg
 
 ----------------------------------------------------------------------------
@@ -255,9 +271,17 @@ resolveWorker host = producerAction host `catch` handler
         putText $ "Exception happened in resolveWorker: " <> show e
         resolveWorker host
 
--- TODO
 shouldWeAnswer :: ResolveMap -> Hostname -> Bool
-shouldWeAnswer _resolveMap _requesterHost = True
+shouldWeAnswer (ResolveMap myHost other) reqHost =
+    if | myHost == reqHost -> True
+       | reqHost `elem` otherHosts -> False
+       | otherwise -> null otherHosts || dist myHost <= minimum (map dist otherHosts)
+      where
+        otherHosts :: [Hostname]
+        otherHosts = map (\(host, _addr) -> host) other
+
+        dist :: Hostname -> Int
+        dist host = hash host - hash reqHost
 
 producerAction :: Hostname -> IO ()
 producerAction myHostname = withSocketsDo $ do
@@ -318,6 +342,12 @@ handleEvent YMDnsConfig{..} event = case event of
         M.lookup sender <$> use lHeartbeatTimers >>= \case
             Nothing    -> return () -- either our own heartbeat or an unknown node
             Just timer -> liftIO $ updateDelay timer heartbeatTimeout
+    MulticastMessage sender (YMDnsRequest requestedHost) -> do
+        resolveMap <- use lResolveMap
+        when (shouldWeAnswer resolveMap requestedHost) $ do
+            let result = resolve resolveMap requestedHost
+            putText $ "resolving result: " <> show result
+            sendMsgTo unicastSocket sender $ YMDnsResponse result
     MulticastMessage _ _ -> do
         fail "unexpected multicast message"
     ResendHeartbeat -> do
@@ -338,15 +368,24 @@ serveProducer host = void $ forkIO $ resolveWorker $ Hostname host
 -- Worker, client part
 -----------------------------------------------------------------------------
 
-sendRequest :: String -> IO ()
-sendRequest host = withSocketsDo $ do
-    sock <- createUdpSocket
-    let msg = YMDnsRequest $ Hostname host
-    sendMsgTo sock multicastAddress msg
+resolveHost :: Hostname -> IO (Maybe InetAddress)
+resolveHost host = withSocketsDo $ do
+    udpSocket <- createUdpSocket
 
--- TODO: how to do it nicely?
-waitForResponse :: IO ResolveMap
-waitForResponse = notImplemented
+    let resendInterval = seconds 3
+    (resolveResult, sender) <- retryM $ do
+        putText "sending request"
+        sendMsgTo udpSocket multicastAddress $ YMDnsRequest host
+        timeout resendInterval $ retryM $ do
+            (msg, sender) <- recvMsgFrom udpSocket
+            case msg of
+                YMDnsResponse result -> return $ Just (result, sender)
+                _                    -> return Nothing
 
-downloadFile :: ResolveMap -> IO ()
-downloadFile _ = putText "Haha, loh, failov net"
+    let res = case resolveResult of
+            NotFound   -> Nothing
+            Owner      -> Just sender
+            Found addr -> Just addr
+
+    putText $ "resolved: " <> show res
+    return res
