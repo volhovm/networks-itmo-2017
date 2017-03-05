@@ -247,7 +247,6 @@ startMulticastListener eventChannel multicastSocket = do
         (msg, sender) <- recvMsgFrom multicastSocket
         writeChan eventChannel (MulticastMessage sender msg)
 
-
 -- | YMDns server, blocks.
 resolveWorker :: Hostname -> IO ()
 resolveWorker host = producerAction host `catch` handler
