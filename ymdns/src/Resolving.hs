@@ -11,7 +11,7 @@ module Resolving where
 
 import           Control.Concurrent           (forkIO)
 import           Control.Concurrent.STM.Delay (Delay, newDelay, updateDelay, waitDelay)
-import           Control.Lens                 (makeLenses, (%=))
+import           Control.Lens                 (makeLenses, (%=), at, (.=))
 import qualified Data.ByteString              as BS
 import qualified Data.ByteString.Internal     as BS (c2w)
 import           Data.Hashable                (hash)
@@ -55,7 +55,6 @@ createHostname s = do
     mapM_ (checkHostnameChar . BS.c2w) s
     pure $ Hostname s
 
-
 data InetAddress = InetAddress
     { ia_address :: Word32
     , ia_port    :: Word16
@@ -74,28 +73,31 @@ sockAddrToInetAddress :: SockAddr -> InetAddress
 sockAddrToInetAddress (SockAddrInet port addr) = InetAddress addr (fromIntegral port)
 sockAddrToInetAddress _  = panic "sockAddrToInetAddress: not ipv4 address"
 
-
 -- | Resolve map from hostname to ip.
 data ResolveMap = ResolveMap
-    { ownerHost     :: Hostname
-    , getResolveMap :: [(Hostname, InetAddress)]
+    { _ownerHost     :: Hostname
+    , _ownerLoad     :: Word8
+    , _getResolveMap :: [(Hostname, (InetAddress, Word8))]
     } deriving (Show, Generic)
 
-addHostname :: Hostname -> InetAddress -> ResolveMap -> ResolveMap
-addHostname host addr (ResolveMap oh other) = ResolveMap oh ((host,addr):other)
+makeLenses ''ResolveMap
+
+addHostname :: Hostname -> InetAddress -> Word8 -> ResolveMap -> ResolveMap
+addHostname host addr load (ResolveMap oh ol other) = ResolveMap oh ol ((host,(addr, load)):other)
 
 -- new ResolveMap (when we are the first node in the network)
-newResolveMap :: Hostname -> ResolveMap
-newResolveMap myHostname = ResolveMap myHostname []
+newResolveMap :: Hostname -> Word8 -> ResolveMap
+newResolveMap myHostname myLoad = ResolveMap myHostname myLoad []
 
 -- convert received ResolveMap
-adaptResolveMap :: Hostname -> InetAddress -> ResolveMap -> ResolveMap
-adaptResolveMap myHostname senderAddress (ResolveMap senderHost other)
-    = ResolveMap myHostname ((senderHost, senderAddress) : other)
+adaptResolveMap :: Hostname -> InetAddress -> Word8 -> ResolveMap -> ResolveMap
+adaptResolveMap myHostname senderAddress load (ResolveMap senderHost senderLoad other)
+    = ResolveMap myHostname load ((senderHost, (senderAddress, senderLoad)) : other)
 
 resolveMapRemove :: InetAddress -> ResolveMap -> ResolveMap
-resolveMapRemove address (ResolveMap oh other)
-    = ResolveMap oh $ filter (\(_host, address') -> address' /= address) other
+resolveMapRemove address (ResolveMap oh ol other)
+    = ResolveMap oh ol $ filter (\(_host, (address', _)) -> address' /= address) other
+
 data ResolveResult
     = NotFound
     | Owner
@@ -103,11 +105,10 @@ data ResolveResult
     deriving (Show, Generic)
 
 resolve :: ResolveMap -> Hostname -> ResolveResult
-resolve (ResolveMap ownerHost _) reqHost | ownerHost == reqHost = Owner
-resolve (ResolveMap _ other) reqHost = case lookup reqHost other of
+resolve (ResolveMap ownerHost _ _) reqHost | ownerHost == reqHost = Owner
+resolve (ResolveMap _ _ other) reqHost = case lookup reqHost other of
     Nothing   -> NotFound
-    Just addr -> Found addr
-
+    Just (addr, _) -> Found addr
 
 -- | YMDns message type
 data YMDnsMsg
@@ -115,7 +116,7 @@ data YMDnsMsg
     | YMDnsShare { ymdShared :: ResolveMap }
     | YMDnsRequest { ymdReq :: Hostname}
     | YMDnsResponse { ymdResp :: ResolveResult }
-    | YMDnsHeartbeat
+    | YMDnsHeartbeat { ymdLoad :: Word8 }
     deriving (Show, Generic)
 
 ----------------------------------------------------------------------------
@@ -145,19 +146,24 @@ instance Store Hostname where
             pure $ chr $ fromIntegral c'
 
 instance Store ResolveMap where
-    size = VarSize $ \(ResolveMap (Hostname oh) xs) ->
-            (1 + length oh) + 1 + sum (map (\(Hostname h,_) -> (1 + length h) + 6) xs)
-    poke (ResolveMap oh xs) = do
+    size = VarSize $ \(ResolveMap (Hostname oh) ol xs) ->
+            (1 + length oh) + 1 + 1 + sum (map (\(Hostname h,_) -> (1 + length h) + 6 + 1) xs)
+    poke (ResolveMap oh ol xs) = do
         when (length xs > 256) $
             fail "Resolve map length shouldn't be more than 256 elements long"
         poke oh
+        poke ol
         poke (fromIntegral (length xs) :: Word8)
-        forM_ xs $ \(h,ip) -> poke h >> poke ip
+        forM_ xs $ \(h,(ip,l)) -> poke h >> poke ip >> poke l
     peek = do
         (oh :: Hostname) <- peek
+        (ol :: Word8) <- peek
         (l :: Word8) <- peek
-        fmap (ResolveMap oh) . replicateM (fromIntegral l) $
-            (,) <$> peek <*> peek
+        fmap (ResolveMap oh ol) . replicateM (fromIntegral l) $ do
+            host <- peek
+            addr <- peek
+            load <- peek
+            pure (host, (addr, load))
 
 -- Using generics here s licom mrazi
 instance Store ResolveResult
@@ -221,8 +227,8 @@ recvMsgFrom sock = do
 ----------------------------------------------------------------------------
 -- Worker, server part
 ----------------------------------------------------------------------------
-
 data YMDnsEvent
+
     = MulticastMessage InetAddress YMDnsMsg
     | ResendHeartbeat
     | HeartbeatTimeout InetAddress
@@ -274,7 +280,7 @@ resolveWorker host kNeighbors =
         resolveWorker host kNeighbors
 
 shouldWeAnswer :: ResolveMap -> Int -> Hostname -> Bool
-shouldWeAnswer (ResolveMap myHost other) k reqHost =
+shouldWeAnswer (ResolveMap myHost _ other) k reqHost =
     if | myHost == reqHost -> True
        | otherwise -> null otherHosts || dist myHost < fst pastKNeighbor
   where
@@ -293,8 +299,8 @@ shouldWeAnswer (ResolveMap myHost other) k reqHost =
 producerAction :: Hostname -> Int -> IO ()
 producerAction myHostname kNeighbors = withSocketsDo $ do
     unicastSocket <- createUdpSocket
-
     let joinResendInterval = seconds 1
+
         joinRetries = 3
 
     {- joining and getting initial ResolveMap:
@@ -304,7 +310,7 @@ producerAction myHostname kNeighbors = withSocketsDo $ do
        - if still no response then there are probably no other nodes
     -}
     initialResolveMap <-
-        fmap (fromMaybe $ newResolveMap myHostname) $
+        fmap (fromMaybe $ newResolveMap myHostname 0) $
         retryMN joinRetries $ do
           putText "sending Join"
           sendMsgTo unicastSocket multicastAddress $ YMDnsJoin myHostname
@@ -313,7 +319,7 @@ producerAction myHostname kNeighbors = withSocketsDo $ do
               (msg, sender) <- recvMsgFrom unicastSocket
               case msg of
                   YMDnsShare nodeMap ->
-                    return $ Just $ adaptResolveMap myHostname sender nodeMap
+                    return $ Just $ adaptResolveMap myHostname sender 0 nodeMap
                   _ -> return Nothing  -- ignore other messages
     putText $ "initial map: " <> show initialResolveMap
 
@@ -321,17 +327,17 @@ producerAction myHostname kNeighbors = withSocketsDo $ do
 
     eventChannel <- newChan @ YMDnsEvent
     initialHeartbeatTimers <- M.fromList <$> do
-        forM (getResolveMap initialResolveMap) $ \(_host, addr) -> do
+        forM (_getResolveMap initialResolveMap) $ \(_host, (addr, _load)) -> do
             (,) addr <$> startHeartbeatTimer eventChannel addr
     startMulticastListener eventChannel multicastSocket
     scheduleNextHeartbeat eventChannel
 
     let initialState = YMDnsState initialResolveMap initialHeartbeatTimers
     let config = YMDnsConfig{..}
-   -- unicastSocket
-   --                         , multicastSocket
-   --                         , eventChannel
-   --                         , 4}
+    -- unicastSocket
+    --                         , multicastSocket
+    --                         , eventChannel
+    --                         , 4}
 
     -- main loop
     void $ flip runStateT initialState $
@@ -345,14 +351,19 @@ handleEvent YMDnsConfig{..} event = case event of
         use lResolveMap >>= \resolveMap ->
             when (shouldWeAnswer resolveMap kNeighbors senderHost) $
                 sendMsgTo unicastSocket sender $ YMDnsShare resolveMap
-        lResolveMap %= addHostname senderHost sender
+        lResolveMap %= addHostname senderHost sender 0
         startHeartbeatTimer eventChannel sender >>= \timer ->
             lHeartbeatTimers %= M.insert sender timer
         use lResolveMap >>= \m -> putText ("current map: " <> show m)
-    MulticastMessage sender YMDnsHeartbeat -> do
+    MulticastMessage sender (YMDnsHeartbeat load) -> do
         M.lookup sender <$> use lHeartbeatTimers >>= \case
             Nothing    -> return () -- either our own heartbeat or an unknown node
-            Just timer -> liftIO $ updateDelay timer heartbeatTimeout
+            Just timer -> do
+                liftIO $ updateDelay timer heartbeatTimeout
+                let mapper a@(host, (addr, _))
+                        | addr == sender = (host, (addr, load))
+                        | otherwise = a
+                lResolveMap . getResolveMap %= map mapper
     MulticastMessage sender (YMDnsRequest requestedHost) -> do
         resolveMap <- use lResolveMap
         when (shouldWeAnswer resolveMap kNeighbors requestedHost) $ do
@@ -365,7 +376,8 @@ handleEvent YMDnsConfig{..} event = case event of
         fail "unexpected multicast message"
     ResendHeartbeat -> do
         putText $ "sending heartbeat"
-        sendMsgTo unicastSocket multicastAddress YMDnsHeartbeat
+        ownLoad <- use $ lResolveMap . ownerLoad
+        sendMsgTo unicastSocket multicastAddress $ YMDnsHeartbeat ownLoad
         liftIO $ scheduleNextHeartbeat eventChannel
     HeartbeatTimeout address -> do
         putText $ "node timed out: " <> show address
