@@ -1,22 +1,28 @@
 {-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell     #-}
 
 -- | YMDNS protocol implementation, all those multicast-related
 -- things.
 
 module Resolving where
 
-import           Control.Concurrent        (forkIO)
-import qualified Data.ByteString           as BS
-import qualified Data.ByteString.Internal  as BS (c2w)
-import           Data.Store                (Size (..), Store (..), decode, encode)
-import qualified GHC.Show                  (show)
-import           Network.BSD               (getProtocolNumber)
-import           Network.Multicast         (multicastReceiver)
-import           Network.Socket            hiding (recv, recvFrom, send, sendTo)
+import           Control.Concurrent           (forkIO)
+import           Control.Concurrent.STM.Delay (Delay, newDelay, updateDelay, waitDelay)
+import           Control.Lens                 (makeLenses, (%=))
+import qualified Data.ByteString              as BS
+import qualified Data.ByteString.Internal     as BS (c2w)
+import qualified Data.Map.Strict              as M
+import           Data.Store                   (Size (..), Store (..), decode, encode)
+import qualified GHC.Show                     (show)
+import           Network.BSD                  (getProtocolNumber)
+import           Network.Multicast            (multicastReceiver)
+import           Network.Socket               hiding (recv, recvFrom, send, sendTo)
 import           Network.Socket.ByteString
-import           System.Timeout            (timeout)
-import           Universum                 hiding (ByteString)
+import           System.Timeout               (timeout)
+import           Universum                    hiding (ByteString)
 
 ----------------------------------------------------------------------------
 -- Network message types
@@ -48,7 +54,7 @@ createHostname s = do
 data InetAddress = InetAddress
     { ia_address :: Word32
     , ia_port    :: Word16
-    }
+    } deriving (Eq, Ord)
 
 instance Show InetAddress where
     show (InetAddress addr port) = concat
@@ -82,6 +88,10 @@ newResolveMap myHostname = ResolveMap myHostname []
 adaptResolveMap :: Hostname -> InetAddress -> ResolveMap -> ResolveMap
 adaptResolveMap myHostname senderAddress (ResolveMap senderHost other)
     = ResolveMap myHostname ((senderHost, senderAddress) : other)
+
+resolveMapRemove :: InetAddress -> ResolveMap -> ResolveMap
+resolveMapRemove address (ResolveMap oh other)
+    = ResolveMap oh $ filter (\(_host, address') -> address' /= address) other
 
 
 -- | YMDns message type
@@ -157,8 +167,8 @@ retryMN n action =
     Just a -> return (Just a)
     Nothing -> retryMN (n-1) action
 
-timeoutS :: Int -> IO a -> IO (Maybe a)
-timeoutS k = timeout (k * 10^(6::Int))
+seconds :: Int -> Int
+seconds k = k * 10^(6::Int)
 
 ----------------------------------------------------------------------------
 -- Protocol helpers
@@ -196,6 +206,48 @@ recvMsgFrom sock = do
 -- Worker, server part
 ----------------------------------------------------------------------------
 
+data YMDnsEvent
+    = MulticastMessage InetAddress YMDnsMsg
+    | ResendHeartbeat
+    | HeartbeatTimeout InetAddress
+
+data YMDnsConfig = YMDnsConfig
+  { unicastSocket   :: Socket
+  , multicastSocket :: Socket
+  , eventChannel    :: Chan YMDnsEvent
+  }
+
+data YMDnsState = YMDnsState
+  { _lResolveMap           :: ResolveMap
+  , _lHeartbeatTimers :: M.Map InetAddress Delay
+  }
+
+makeLenses ''YMDnsState
+
+resendHeartbeatInterval, heartbeatTimeout :: Int
+resendHeartbeatInterval = seconds 3
+heartbeatTimeout = seconds 10
+
+startHeartbeatTimer :: (MonadIO m) => Chan YMDnsEvent -> InetAddress -> m Delay
+startHeartbeatTimer eventChannel address = liftIO $ do
+    timer <- newDelay heartbeatTimeout
+    _ <- forkIO $ do
+        atomically $ waitDelay timer
+        writeChan eventChannel (HeartbeatTimeout address)
+    return timer
+
+scheduleNextHeartbeat :: Chan YMDnsEvent -> IO ()
+scheduleNextHeartbeat eventChannel = void $ forkIO $ do
+    threadDelay resendHeartbeatInterval
+    writeChan eventChannel ResendHeartbeat
+
+startMulticastListener :: Chan YMDnsEvent -> Socket -> IO ()
+startMulticastListener eventChannel multicastSocket = do
+    void $ forkIO $ forever $ do
+        (msg, sender) <- recvMsgFrom multicastSocket
+        writeChan eventChannel (MulticastMessage sender msg)
+
+
 -- | YMDns server, blocks.
 resolveWorker :: Hostname -> IO ()
 resolveWorker host = producerAction host `catch` handler
@@ -212,8 +264,8 @@ producerAction :: Hostname -> IO ()
 producerAction myHostname = withSocketsDo $ do
     unicastSocket <- createUdpSocket
 
-    let joinResendIntervalS = 3
-        joinRetries = 5
+    let joinResendInterval = seconds 1
+        joinRetries = 3
 
     {- joining and getting initial ResolveMap:
        - send Join
@@ -226,29 +278,58 @@ producerAction myHostname = withSocketsDo $ do
         retryMN joinRetries $ do
           putText "sending Join"
           sendMsgTo unicastSocket multicastAddress $ YMDnsJoin myHostname
-          timeoutS joinResendIntervalS $ do
+          timeout joinResendInterval $ do
             retryM $ do
               (msg, sender) <- recvMsgFrom unicastSocket
               case msg of
                   YMDnsShare nodeMap ->
                     return $ Just $ adaptResolveMap myHostname sender nodeMap
                   _ -> return Nothing  -- ignore other messages
+    putText $ "initial map: " <> show initialResolveMap
 
     multicastSocket <- createMulticastSocket
-    putText "joined the network"
+
+    eventChannel <- newChan @ YMDnsEvent
+    initialHeartbeatTimers <- M.fromList <$> do
+        forM (getResolveMap initialResolveMap) $ \(_host, addr) -> do
+            (,) addr <$> startHeartbeatTimer eventChannel addr
+    startMulticastListener eventChannel multicastSocket
+    scheduleNextHeartbeat eventChannel
+
+    let initialState = YMDnsState initialResolveMap initialHeartbeatTimers
+    let config = YMDnsConfig{unicastSocket, multicastSocket, eventChannel}
 
     -- main loop
-    void $ flip runStateT initialResolveMap $
+    void $ flip runStateT initialState $
       forever $ do
-        gets identity >>= \m -> putText ("current map: " <> show m)
-        (msg, sender) <- recvMsgFrom multicastSocket
-        case msg of
-            YMDnsJoin senderHost -> do
-                resolveMap <- gets identity
-                when (shouldWeAnswer resolveMap senderHost) $
-                    sendMsgTo unicastSocket sender $ YMDnsShare resolveMap
-                modify (addHostname senderHost sender)
-            _ -> return ()
+        event <- liftIO $ readChan eventChannel
+        handleEvent config event
+
+handleEvent :: YMDnsConfig -> YMDnsEvent -> StateT YMDnsState IO ()
+handleEvent YMDnsConfig{..} event = case event of
+    MulticastMessage sender (YMDnsJoin senderHost) -> do
+        use lResolveMap >>= \resolveMap ->
+            when (shouldWeAnswer resolveMap senderHost) $
+                sendMsgTo unicastSocket sender $ YMDnsShare resolveMap
+        lResolveMap %= addHostname senderHost sender
+        startHeartbeatTimer eventChannel sender >>= \timer ->
+            lHeartbeatTimers %= M.insert sender timer
+        use lResolveMap >>= \m -> putText ("current map: " <> show m)
+    MulticastMessage sender YMDnsHeartbeat -> do
+        M.lookup sender <$> use lHeartbeatTimers >>= \case
+            Nothing    -> return () -- either our own heartbeat or an unknown node
+            Just timer -> liftIO $ updateDelay timer heartbeatTimeout
+    MulticastMessage _ _ -> do
+        fail "unexpected multicast message"
+    ResendHeartbeat -> do
+        putText $ "sending heartbeat"
+        sendMsgTo unicastSocket multicastAddress YMDnsHeartbeat
+        liftIO $ scheduleNextHeartbeat eventChannel
+    HeartbeatTimeout address -> do
+        putText $ "node timed out: " <> show address
+        lResolveMap %= resolveMapRemove address
+        lHeartbeatTimers %= M.delete address
+        use lResolveMap >>= \m -> putText ("current map: " <> show m)
 
 -- | Function for spawning a producer in another thread
 serveProducer :: String -> IO ()
