@@ -14,7 +14,9 @@ main = do
     o@Opts{..} <- getOptions
     putText $ "Launched with opts: " <> show o
     case action of
-        YMServe {..}  -> serveProducer hostname >> runReportServer port filesDir
+        YMServe {..}  -> do
+            serveProducer hostname ymdnsK
+            runReportServer port filesDir
         YMRequest{..} -> do
             let uri = fromMaybe (panic "Couldn't parse URI") $
                           parseURI requestString
@@ -25,10 +27,6 @@ main = do
                 Nothing -> fail "host not found"
                 Just (InetAddress addr _port) -> return $ showHostAddress addr
 
-            -- NETWORK.URI
-            -- USE
-            -- LENS
-            -- COME ON!
             let uri' = uri { uriAuthority = (\a -> a { uriRegName = host' }) <$> uriAuthority uri }
                 requestAddress = show uri'
             resp <- get requestAddress

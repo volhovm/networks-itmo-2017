@@ -25,6 +25,7 @@ data Action
 data Opts = Opts
     { action       :: Action
     , ymdnsTimeout :: Int
+    , ymdnsK       :: Int
     } deriving (Show)
 
 serveParser :: Mod CommandFields Action
@@ -65,7 +66,11 @@ optsParser =
     option
         auto
         (long "ymdns-timeout" <> metavar "MILLISECONDS" <> value 3 <>
-         help "Number of seconds to abort connection after")
+         help "Number of seconds to abort connection after") <*>
+    option
+        auto
+        (long "kneighbours" <> metavar "INT" <> value 2 <>
+         help "Algorithm constant -- radius of responders")
 
 getOptions :: IO Opts
 getOptions = do

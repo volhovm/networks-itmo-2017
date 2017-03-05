@@ -15,7 +15,7 @@ import           Control.Lens                 (makeLenses, (%=))
 import qualified Data.ByteString              as BS
 import qualified Data.ByteString.Internal     as BS (c2w)
 import           Data.Hashable                (hash)
-import           Data.List                    (lookup)
+import           Data.List                    (last, lookup)
 import qualified Data.Map.Strict              as M
 import           Data.Store                   (Size (..), Store (..), decode, encode)
 import qualified GHC.Show                     (show)
@@ -230,6 +230,7 @@ data YMDnsEvent
 data YMDnsConfig = YMDnsConfig
   { unicastSocket   :: Socket
   , multicastSocket :: Socket
+  , kNeighbors      :: Int
   , eventChannel    :: Chan YMDnsEvent
   }
 
@@ -264,27 +265,34 @@ startMulticastListener eventChannel multicastSocket = do
         writeChan eventChannel (MulticastMessage sender msg)
 
 -- | YMDns server, blocks.
-resolveWorker :: Hostname -> IO ()
-resolveWorker host = producerAction host `catch` handler
+resolveWorker :: Hostname -> Int -> IO ()
+resolveWorker host kNeighbors =
+    producerAction host kNeighbors `catch` handler
   where
     handler (e :: SomeException) = do
         putText $ "Exception happened in resolveWorker: " <> show e
-        resolveWorker host
+        resolveWorker host kNeighbors
 
-shouldWeAnswer :: ResolveMap -> Hostname -> Bool
-shouldWeAnswer (ResolveMap myHost other) reqHost =
+shouldWeAnswer :: ResolveMap -> Int -> Hostname -> Bool
+shouldWeAnswer (ResolveMap myHost other) k reqHost =
     if | myHost == reqHost -> True
        | reqHost `elem` otherHosts -> False
-       | otherwise -> null otherHosts || dist myHost <= minimum (map dist otherHosts)
-      where
-        otherHosts :: [Hostname]
-        otherHosts = map (\(host, _addr) -> host) other
+       | otherwise -> null otherHosts || dist myHost < fst pastKNeighbor
+  where
+    pastKNeighbor =
+        case drop k searchList of
+            (x:_) -> x
+            []    -> last searchList
+    searchList = sortOn fst $ map (\x -> (dist x,x)) otherHosts
 
-        dist :: Hostname -> Int
-        dist host = hash host - hash reqHost
+    otherHosts :: [Hostname]
+    otherHosts = map (\(host, _addr) -> host) other
 
-producerAction :: Hostname -> IO ()
-producerAction myHostname = withSocketsDo $ do
+    dist :: Hostname -> Int
+    dist host = abs $ hash host - hash reqHost
+
+producerAction :: Hostname -> Int -> IO ()
+producerAction myHostname kNeighbors = withSocketsDo $ do
     unicastSocket <- createUdpSocket
 
     let joinResendInterval = seconds 1
@@ -320,7 +328,11 @@ producerAction myHostname = withSocketsDo $ do
     scheduleNextHeartbeat eventChannel
 
     let initialState = YMDnsState initialResolveMap initialHeartbeatTimers
-    let config = YMDnsConfig{unicastSocket, multicastSocket, eventChannel}
+    let config = YMDnsConfig{..}
+   -- unicastSocket
+   --                         , multicastSocket
+   --                         , eventChannel
+   --                         , 4}
 
     -- main loop
     void $ flip runStateT initialState $
@@ -332,7 +344,7 @@ handleEvent :: YMDnsConfig -> YMDnsEvent -> StateT YMDnsState IO ()
 handleEvent YMDnsConfig{..} event = case event of
     MulticastMessage sender (YMDnsJoin senderHost) -> do
         use lResolveMap >>= \resolveMap ->
-            when (shouldWeAnswer resolveMap senderHost) $
+            when (shouldWeAnswer resolveMap kNeighbors senderHost) $
                 sendMsgTo unicastSocket sender $ YMDnsShare resolveMap
         lResolveMap %= addHostname senderHost sender
         startHeartbeatTimer eventChannel sender >>= \timer ->
@@ -344,10 +356,12 @@ handleEvent YMDnsConfig{..} event = case event of
             Just timer -> liftIO $ updateDelay timer heartbeatTimeout
     MulticastMessage sender (YMDnsRequest requestedHost) -> do
         resolveMap <- use lResolveMap
-        when (shouldWeAnswer resolveMap requestedHost) $ do
+        when (shouldWeAnswer resolveMap kNeighbors requestedHost) $ do
             let result = resolve resolveMap requestedHost
             putText $ "resolving result: " <> show result
+            putText $ "answering to " <> show sender
             sendMsgTo unicastSocket sender $ YMDnsResponse result
+            putText "answered to request"
     MulticastMessage _ _ -> do
         fail "unexpected multicast message"
     ResendHeartbeat -> do
@@ -361,8 +375,9 @@ handleEvent YMDnsConfig{..} event = case event of
         use lResolveMap >>= \m -> putText ("current map: " <> show m)
 
 -- | Function for spawning a producer in another thread
-serveProducer :: String -> IO ()
-serveProducer host = void $ forkIO $ resolveWorker $ Hostname host
+serveProducer :: String -> Int -> IO ()
+serveProducer host kNeighbors =
+    void $ forkIO $ resolveWorker (Hostname host) kNeighbors
 
 -----------------------------------------------------------------------------
 -- Worker, client part
