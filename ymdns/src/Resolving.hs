@@ -276,7 +276,6 @@ resolveWorker host kNeighbors =
 shouldWeAnswer :: ResolveMap -> Int -> Hostname -> Bool
 shouldWeAnswer (ResolveMap myHost other) k reqHost =
     if | myHost == reqHost -> True
-       | reqHost `elem` otherHosts -> False
        | otherwise -> null otherHosts || dist myHost < fst pastKNeighbor
   where
     pastKNeighbor =
