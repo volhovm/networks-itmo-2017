@@ -12,13 +12,13 @@ module Resolving where
 import           Control.Concurrent           (forkIO)
 import           Control.Concurrent.STM.Delay (Delay, newDelay, updateDelay, waitDelay)
 import           Control.Lens                 (makeLenses, (%=), (+=), (-=))
-import           Criterion.Measurement        (getCPUTime, initializeTime)
 import qualified Data.ByteString              as BS
 import qualified Data.ByteString.Internal     as BS (c2w)
 import           Data.Hashable                (hash)
 import           Data.List                    (last, lookup)
 import qualified Data.Map.Strict              as M
 import           Data.Store                   (Size (..), Store (..), decode, encode)
+import           Data.Time                    (diffUTCTime, getCurrentTime)
 import qualified GHC.Show                     (show)
 import           Network.BSD                  (getProtocolNumber)
 import           Network.Multicast            (multicastReceiver)
@@ -152,7 +152,7 @@ instance Store Hostname where
             pure $ chr $ fromIntegral c'
 
 instance Store ResolveMap where
-    size = VarSize $ \(ResolveMap (Hostname oh) ol xs) ->
+    size = VarSize $ \(ResolveMap (Hostname oh) _ol xs) ->
             (1 + length oh) + 1 + 1 + sum (map (\(Hostname h,_) -> (1 + length h) + 6 + 1) xs)
     poke (ResolveMap oh ol xs) = do
         when (length xs > 256) $
@@ -201,11 +201,10 @@ seconds k = k * 10^(6::Int)
 
 timeComputation :: IO a -> IO (Int, a)
 timeComputation action = do
-    initializeTime
-    start <- getCPUTime
+    start <- getCurrentTime
     result <- action
-    end <- getCPUTime
-    return (round (end - start) * 1000, result)
+    end <- getCurrentTime
+    return (round (end `diffUTCTime` start), result)
 
 ----------------------------------------------------------------------------
 -- Protocol helpers
@@ -414,8 +413,8 @@ handleEvent YMDnsConfig{..} event = case event of
                 void . liftIO . forkIO $ do
                     putText "Execution started"
                     (time, result) <- timeComputation $ do
-                      threadDelay (seconds delay)
-                      return "blah"
+                        threadDelay (seconds delay)
+                        pure $ "Task execution finished, done in time ,O.O,"
                     putText "Execution done, sending message"
                     sendMsgTo unicastSocket sender $
                         YMDnsTaskResponse $ Just $ TaskResponse time result
