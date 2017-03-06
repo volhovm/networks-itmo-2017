@@ -110,12 +110,17 @@ resolve (ResolveMap _ _ other) reqHost = case lookup reqHost other of
     Nothing   -> NotFound
     Just (addr, _) -> Found addr
 
+newtype Task = Task Int deriving (Show, Generic, Store)
+newtype TaskResponse = TaskResponse Text deriving (Show, Generic, Store)
+
 -- | YMDns message type
 data YMDnsMsg
     = YMDnsJoin { ymdJoinHostname :: Hostname}
     | YMDnsShare { ymdShared :: ResolveMap }
-    | YMDnsRequest { ymdReq :: Hostname}
+    | YMDnsRequest { ymdReq :: Hostname }
     | YMDnsResponse { ymdResp :: ResolveResult }
+    | YMDnsTask { ymdTask :: Task }
+    | YMDnsTaskResponse { ymdTaskResponse :: Maybe TaskResponse }
     | YMDnsHeartbeat { ymdLoad :: Word8 }
     deriving (Show, Generic)
 
@@ -227,8 +232,8 @@ recvMsgFrom sock = do
 ----------------------------------------------------------------------------
 -- Worker, server part
 ----------------------------------------------------------------------------
-data YMDnsEvent
 
+data YMDnsEvent
     = MulticastMessage InetAddress YMDnsMsg
     | ResendHeartbeat
     | HeartbeatTimeout InetAddress
@@ -296,6 +301,11 @@ shouldWeAnswer (ResolveMap myHost _ other) k reqHost =
     dist :: Hostname -> Int
     dist host = abs $ hash host - hash reqHost
 
+data WhatToDoAboutExecution = Execute | Pass | Fail
+
+shouldWeExecute :: ResolveMap -> WhatToDoAboutExecution
+shouldWeExecute = notImplemented
+
 producerAction :: Hostname -> Int -> IO ()
 producerAction myHostname kNeighbors = withSocketsDo $ do
     unicastSocket <- createUdpSocket
@@ -326,9 +336,11 @@ producerAction myHostname kNeighbors = withSocketsDo $ do
     multicastSocket <- createMulticastSocket
 
     eventChannel <- newChan @ YMDnsEvent
+
     initialHeartbeatTimers <- M.fromList <$> do
         forM (_getResolveMap initialResolveMap) $ \(_host, (addr, _load)) -> do
             (,) addr <$> startHeartbeatTimer eventChannel addr
+
     startMulticastListener eventChannel multicastSocket
     scheduleNextHeartbeat eventChannel
 
@@ -372,6 +384,16 @@ handleEvent YMDnsConfig{..} event = case event of
             putText $ "answering to " <> show sender
             sendMsgTo unicastSocket sender $ YMDnsResponse result
             putText "answered to request"
+    MulticastMessage sender (YMDnsTask (Task delay)) -> do
+        resolveMap <- use lResolveMap
+        case shouldWeExecute resolveMap of
+            Execute -> void . liftIO . forkIO $ do
+                putText "PRINYATO"
+                threadDelay (delay * 1000 * 1000)
+                sendMsgTo unicastSocket sender $ YMDnsTaskResponse $ Just $ TaskResponse "blah"
+                putText "ZAEBOSHENO"
+            Pass -> pass
+            Fail -> sendMsgTo unicastSocket sender $ YMDnsTaskResponse Nothing
     MulticastMessage _ _ -> do
         fail "unexpected multicast message"
     ResendHeartbeat -> do
