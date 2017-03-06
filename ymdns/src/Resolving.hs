@@ -204,7 +204,7 @@ timeComputation action = do
     start <- getCurrentTime
     result <- action
     end <- getCurrentTime
-    return (round (end `diffUTCTime` start), result)
+    return (round $ (end `diffUTCTime` start) * 1000 * 1000, result)
 
 ----------------------------------------------------------------------------
 -- Protocol helpers
