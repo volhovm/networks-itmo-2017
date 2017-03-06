@@ -13,6 +13,7 @@ import           Control.Concurrent           (forkIO)
 import           Control.Concurrent.Lifted    (fork)
 import           Control.Concurrent.STM.Delay (Delay, newDelay, updateDelay, waitDelay)
 import           Control.Lens                 (makeLenses, (%=), (+=), (-=))
+import           Criterion.Measurement        (getCPUTime, initializeTime)
 import qualified Data.ByteString              as BS
 import qualified Data.ByteString.Internal     as BS (c2w)
 import           Data.Hashable                (hash)
@@ -112,7 +113,7 @@ resolve (ResolveMap _ _ other) reqHost = case lookup reqHost other of
     Just (addr, _) -> Found addr
 
 newtype Task = Task Int deriving (Show, Generic, Store)
-newtype TaskResponse = TaskResponse Text deriving (Show, Generic, Store)
+data TaskResponse = TaskResponse Int Text deriving (Show, Generic)
 
 -- | YMDns message type
 data YMDnsMsg
@@ -173,6 +174,7 @@ instance Store ResolveMap where
 
 -- Using generics here s licom mrazi
 instance Store ResolveResult
+instance Store TaskResponse
 instance Store YMDnsMsg
 
 ----------------------------------------------------------------------------
@@ -197,6 +199,14 @@ retryMN n action =
 
 seconds :: Int -> Int
 seconds k = k * 10^(6::Int)
+
+timeComputation :: IO a -> IO (Int, a)
+timeComputation action = do
+    initializeTime
+    start <- getCPUTime
+    result <- action
+    end <- getCPUTime
+    return (round (end - start) * 1000, result)
 
 ----------------------------------------------------------------------------
 -- Protocol helpers
@@ -403,9 +413,12 @@ handleEvent YMDnsConfig{..} event = case event of
                     sendMsgTo unicastSocket multicastAddress $ YMDnsHeartbeat ownLoad
                 void . fork $ do
                     putText "Execution started"
-                    liftIO $ threadDelay (delay * 1000 * 1000)
+                    (time, result) <- liftIO $ timeComputation $ do
+                      threadDelay (seconds delay)
+                      return "blah"
                     putText "Execution done, sending message"
-                    sendMsgTo unicastSocket sender $ YMDnsTaskResponse $ Just $ TaskResponse "blah"
+                    sendMsgTo unicastSocket sender $
+                        YMDnsTaskResponse $ Just $ TaskResponse time result
                     lResolveMap . ownerLoad -= 1
             SRPass -> pass
             SRFail -> sendMsgTo unicastSocket sender $ YMDnsTaskResponse Nothing
