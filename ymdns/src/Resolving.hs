@@ -10,7 +10,6 @@
 module Resolving where
 
 import           Control.Concurrent           (forkIO)
-import           Control.Concurrent.Lifted    (fork)
 import           Control.Concurrent.STM.Delay (Delay, newDelay, updateDelay, waitDelay)
 import           Control.Lens                 (makeLenses, (%=), (+=), (-=))
 import           Criterion.Measurement        (getCPUTime, initializeTime)
@@ -248,6 +247,7 @@ data YMDnsEvent
     = MulticastMessage InetAddress YMDnsMsg
     | ResendHeartbeat
     | HeartbeatTimeout InetAddress
+    | TaskFinished
 
 data YMDnsConfig = YMDnsConfig
   { unicastSocket   :: Socket
@@ -411,15 +411,15 @@ handleEvent YMDnsConfig{..} event = case event of
                 use (lResolveMap . ownerLoad) >>= \ownLoad ->
                     -- resend heartbeat
                     sendMsgTo unicastSocket multicastAddress $ YMDnsHeartbeat ownLoad
-                void . fork $ do
+                void . liftIO . forkIO $ do
                     putText "Execution started"
-                    (time, result) <- liftIO $ timeComputation $ do
+                    (time, result) <- timeComputation $ do
                       threadDelay (seconds delay)
                       return "blah"
                     putText "Execution done, sending message"
                     sendMsgTo unicastSocket sender $
                         YMDnsTaskResponse $ Just $ TaskResponse time result
-                    lResolveMap . ownerLoad -= 1
+                    writeChan eventChannel TaskFinished
             SRPass -> pass
             SRFail -> sendMsgTo unicastSocket sender $ YMDnsTaskResponse Nothing
     MulticastMessage _ _ -> do
@@ -434,6 +434,8 @@ handleEvent YMDnsConfig{..} event = case event of
         lResolveMap %= resolveMapRemove address
         lHeartbeatTimers %= M.delete address
         use lResolveMap >>= \m -> putText ("current map: " <> show m)
+    TaskFinished -> do
+        lResolveMap . ownerLoad -= 1
 
 -- | Function for spawning a producer in another thread
 serveProducer :: String -> Int -> IO ()
