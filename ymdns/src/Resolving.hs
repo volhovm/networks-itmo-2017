@@ -11,7 +11,7 @@ module Resolving where
 
 import           Control.Concurrent           (forkIO)
 import           Control.Concurrent.STM.Delay (Delay, newDelay, updateDelay, waitDelay)
-import           Control.Lens                 (makeLenses, (%=), at, (.=))
+import           Control.Lens                 (makeLenses, (%=))
 import qualified Data.ByteString              as BS
 import qualified Data.ByteString.Internal     as BS (c2w)
 import           Data.Hashable                (hash)
@@ -36,7 +36,7 @@ import           Universum                    hiding (ByteString)
 -- | Hostname we can reserve. Should be <256 chars, ascii low-letters only.
 newtype Hostname = Hostname
     { getHostname :: String
-    } deriving (Show, Eq, Hashable)
+    } deriving (Show, Eq, Ord, Hashable)
 
 checkHostnameChar :: (MonadFail m) => Word8 -> m ()
 checkHostnameChar c =
@@ -105,9 +105,9 @@ data ResolveResult
     deriving (Show, Generic)
 
 resolve :: ResolveMap -> Hostname -> ResolveResult
-resolve (ResolveMap ownerHost _ _) reqHost | ownerHost == reqHost = Owner
+resolve (ResolveMap ownerHost' _ _) reqHost | ownerHost' == reqHost = Owner
 resolve (ResolveMap _ _ other) reqHost = case lookup reqHost other of
-    Nothing   -> NotFound
+    Nothing        -> NotFound
     Just (addr, _) -> Found addr
 
 newtype Task = Task Int deriving (Show, Generic, Store)
@@ -301,10 +301,17 @@ shouldWeAnswer (ResolveMap myHost _ other) k reqHost =
     dist :: Hostname -> Int
     dist host = abs $ hash host - hash reqHost
 
-data WhatToDoAboutExecution = Execute | Pass | Fail
+data ShouldExecuteRes = SRExecute | SRPass | SRFail
 
-shouldWeExecute :: ResolveMap -> WhatToDoAboutExecution
-shouldWeExecute = notImplemented
+shouldWeExecute :: ResolveMap -> ShouldExecuteRes
+shouldWeExecute resmap
+    | ourpair < minWhatever =
+      if resmap ^. ownerLoad < maxLoadFactor then SRExecute else SRFail
+    | otherwise = SRPass
+  where
+    ourpair = (resmap ^. ownerLoad, resmap ^. ownerHost)
+    minWhatever = minimum $ map (\(h,(_,w)) -> (w,h)) $ view getResolveMap resmap
+    maxLoadFactor = 2
 
 producerAction :: Hostname -> Int -> IO ()
 producerAction myHostname kNeighbors = withSocketsDo $ do
@@ -387,13 +394,13 @@ handleEvent YMDnsConfig{..} event = case event of
     MulticastMessage sender (YMDnsTask (Task delay)) -> do
         resolveMap <- use lResolveMap
         case shouldWeExecute resolveMap of
-            Execute -> void . liftIO . forkIO $ do
-                putText "PRINYATO"
+            SRExecute -> void . liftIO . forkIO $ do
+                putText "Execution started"
                 threadDelay (delay * 1000 * 1000)
+                putText "Execution done, sending message"
                 sendMsgTo unicastSocket sender $ YMDnsTaskResponse $ Just $ TaskResponse "blah"
-                putText "ZAEBOSHENO"
-            Pass -> pass
-            Fail -> sendMsgTo unicastSocket sender $ YMDnsTaskResponse Nothing
+            SRPass -> pass
+            SRFail -> sendMsgTo unicastSocket sender $ YMDnsTaskResponse Nothing
     MulticastMessage _ _ -> do
         fail "unexpected multicast message"
     ResendHeartbeat -> do
@@ -437,3 +444,15 @@ resolveHost host = withSocketsDo $ do
 
     putText $ "resolved: " <> show res
     return res
+
+
+offloadTask :: Task -> IO (Maybe TaskResponse)
+offloadTask t = withSocketsDo $ do
+    udpSocket <- createUdpSocket
+
+    putText "sending request"
+    sendMsgTo udpSocket multicastAddress $ YMDnsTask t
+    (msg, _) <- recvMsgFrom udpSocket
+    case msg of
+      YMDnsTaskResponse r -> pure r
+      e                   -> panic ("Unknown response: " <> show e)

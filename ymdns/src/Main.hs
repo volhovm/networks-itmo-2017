@@ -31,3 +31,5 @@ main = do
                 requestAddress = show uri'
             resp <- get requestAddress
             putStrLn $ resp ^. responseBody
+        YMSendWorker delay ->
+            print =<< offloadTask (Task delay)

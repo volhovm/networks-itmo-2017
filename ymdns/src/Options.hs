@@ -20,6 +20,7 @@ data Action
               , filesDir :: FilePath
               , hostname :: String}
     | YMRequest { requestString :: String}
+    | YMSendWorker { taskTimeout :: Int }
     deriving (Show)
 
 data Opts = Opts
@@ -56,8 +57,19 @@ requestParser = command "request" $ info opts desc
     desc =
         progDesc "Make a request to http server resolving hostname using ymdns"
 
+sendWorkerParser :: Mod CommandFields Action
+sendWorkerParser = command "sendworker" $ info opts desc
+  where
+    opts =
+        YMSendWorker <$>
+        option auto
+            (long "delay" <> metavar "INT" <>
+             help "Worker task delay")
+    desc = progDesc "Offload work to nodes"
+
+
 actionParser :: Parser Action
-actionParser = subparser $ serveParser <> requestParser
+actionParser = subparser $ serveParser <> requestParser <> sendWorkerParser
 
 optsParser :: Parser Opts
 optsParser =
