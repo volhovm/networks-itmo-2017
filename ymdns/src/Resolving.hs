@@ -306,12 +306,13 @@ data ShouldExecuteRes = SRExecute | SRPass | SRFail
 
 shouldWeExecute :: ResolveMap -> ShouldExecuteRes
 shouldWeExecute resmap
-    | ourpair < minWhatever =
+    | null otherNodes || ourpair < minWhatever =
       if resmap ^. ownerLoad < maxLoadFactor then SRExecute else SRFail
     | otherwise = SRPass
   where
     ourpair = (resmap ^. ownerLoad, resmap ^. ownerHost)
-    minWhatever = minimum $ map (\(h,(_,w)) -> (w,h)) $ view getResolveMap resmap
+    otherNodes = view getResolveMap resmap
+    minWhatever = minimum $ map (\(h,(_,w)) -> (w,h)) $ otherNodes
     maxLoadFactor = 2
 
 producerAction :: Hostname -> Int -> IO ()
