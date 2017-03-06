@@ -10,8 +10,9 @@
 module Resolving where
 
 import           Control.Concurrent           (forkIO)
+import           Control.Concurrent.Lifted    (fork)
 import           Control.Concurrent.STM.Delay (Delay, newDelay, updateDelay, waitDelay)
-import           Control.Lens                 (makeLenses, (%=))
+import           Control.Lens                 (makeLenses, (%=), (+=), (-=))
 import qualified Data.ByteString              as BS
 import qualified Data.ByteString.Internal     as BS (c2w)
 import           Data.Hashable                (hash)
@@ -394,11 +395,17 @@ handleEvent YMDnsConfig{..} event = case event of
     MulticastMessage sender (YMDnsTask (Task delay)) -> do
         resolveMap <- use lResolveMap
         case shouldWeExecute resolveMap of
-            SRExecute -> void . liftIO . forkIO $ do
-                putText "Execution started"
-                threadDelay (delay * 1000 * 1000)
-                putText "Execution done, sending message"
-                sendMsgTo unicastSocket sender $ YMDnsTaskResponse $ Just $ TaskResponse "blah"
+            SRExecute -> do
+                lResolveMap . ownerLoad += 1
+                use (lResolveMap . ownerLoad) >>= \ownLoad ->
+                    -- resend heartbeat
+                    sendMsgTo unicastSocket multicastAddress $ YMDnsHeartbeat ownLoad
+                void . fork $ do
+                    putText "Execution started"
+                    liftIO $ threadDelay (delay * 1000 * 1000)
+                    putText "Execution done, sending message"
+                    sendMsgTo unicastSocket sender $ YMDnsTaskResponse $ Just $ TaskResponse "blah"
+                    lResolveMap . ownerLoad -= 1
             SRPass -> pass
             SRFail -> sendMsgTo unicastSocket sender $ YMDnsTaskResponse Nothing
     MulticastMessage _ _ -> do
