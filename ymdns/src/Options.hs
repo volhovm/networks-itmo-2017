@@ -21,6 +21,7 @@ data Action
               , hostname :: String}
     | YMRequest { requestString :: String}
     | YMSendWorker { taskTimeout :: Int }
+    | YMCancelWorker { taskTid :: Word32 }
     deriving (Show)
 
 data Opts = Opts
@@ -67,9 +68,21 @@ sendWorkerParser = command "sendworker" $ info opts desc
              help "Worker task delay")
     desc = progDesc "Offload work to nodes"
 
+cancelWorkerParser :: Mod CommandFields Action
+cancelWorkerParser = command "cancelworker" $ info opts desc
+  where
+    opts =
+        YMCancelWorker <$>
+        option auto
+            (long "tid" <> metavar "INT" <>
+             help "Id of task we want to cancel")
+    desc = progDesc "Offload work to nodes"
+
 
 actionParser :: Parser Action
-actionParser = subparser $ serveParser <> requestParser <> sendWorkerParser
+actionParser =
+    subparser $
+    serveParser <> requestParser <> sendWorkerParser <> cancelWorkerParser
 
 optsParser :: Parser Opts
 optsParser =

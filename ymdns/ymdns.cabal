@@ -28,6 +28,7 @@ executable ymdns-cli
                      , network-multicast
                      , network-uri >= 2.6.1.0
                      , optparse-simple >= 0.0.3
+                     , random >= 1.1
                      , scotty >= 0.11.0
                      , stm >= 2.4.4.1
                      , stm-delay

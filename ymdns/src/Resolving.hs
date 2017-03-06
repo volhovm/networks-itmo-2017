@@ -9,9 +9,9 @@
 
 module Resolving where
 
-import           Control.Concurrent           (forkIO)
+import           Control.Concurrent           (ThreadId, forkIO, killThread)
 import           Control.Concurrent.STM.Delay (Delay, newDelay, updateDelay, waitDelay)
-import           Control.Lens                 (makeLenses, (%=), (+=), (-=))
+import           Control.Lens                 (makeLenses, uses, (%=), (+=), (-=))
 import qualified Data.ByteString              as BS
 import qualified Data.ByteString.Internal     as BS (c2w)
 import           Data.Hashable                (hash)
@@ -111,7 +111,7 @@ resolve (ResolveMap _ _ other) reqHost = case lookup reqHost other of
     Nothing        -> NotFound
     Just (addr, _) -> Found addr
 
-newtype Task = Task Int deriving (Show, Generic, Store)
+data Task = Task Word32 Int deriving (Show, Generic)
 data TaskResponse = TaskResponse Int Text deriving (Show, Generic)
 
 -- | YMDns message type
@@ -121,6 +121,7 @@ data YMDnsMsg
     | YMDnsRequest { ymdReq :: Hostname }
     | YMDnsResponse { ymdResp :: ResolveResult }
     | YMDnsTask { ymdTask :: Task }
+    | YMDnsTaskCancel { ymdTaskId :: Word32 }
     | YMDnsTaskResponse { ymdTaskResponse :: Maybe TaskResponse }
     | YMDnsHeartbeat { ymdLoad :: Word8 }
     deriving (Show, Generic)
@@ -172,6 +173,7 @@ instance Store ResolveMap where
             pure (host, (addr, load))
 
 -- Using generics here s licom mrazi
+instance Store Task
 instance Store ResolveResult
 instance Store TaskResponse
 instance Store YMDnsMsg
@@ -246,7 +248,7 @@ data YMDnsEvent
     = MulticastMessage InetAddress YMDnsMsg
     | ResendHeartbeat
     | HeartbeatTimeout InetAddress
-    | TaskFinished
+    | TaskFinished Word32
 
 data YMDnsConfig = YMDnsConfig
   { unicastSocket   :: Socket
@@ -258,6 +260,7 @@ data YMDnsConfig = YMDnsConfig
 data YMDnsState = YMDnsState
   { _lResolveMap      :: ResolveMap
   , _lHeartbeatTimers :: M.Map InetAddress Delay
+  , _lWorkerTIDs      :: M.Map Word32 ThreadId
   }
 
 makeLenses ''YMDnsState
@@ -362,7 +365,9 @@ producerAction myHostname kNeighbors = withSocketsDo $ do
     startMulticastListener eventChannel multicastSocket
     scheduleNextHeartbeat eventChannel
 
-    let initialState = YMDnsState initialResolveMap initialHeartbeatTimers
+    let initialState = YMDnsState initialResolveMap
+                                  initialHeartbeatTimers
+                                  M.empty
     let config = YMDnsConfig{..}
     -- unicastSocket
     --                         , multicastSocket
@@ -402,7 +407,7 @@ handleEvent YMDnsConfig{..} event = case event of
             putText $ "answering to " <> show sender
             sendMsgTo unicastSocket sender $ YMDnsResponse result
             putText "answered to request"
-    MulticastMessage sender (YMDnsTask (Task delay)) -> do
+    MulticastMessage sender (YMDnsTask (Task tid delay)) -> do
         resolveMap <- use lResolveMap
         case shouldWeExecute resolveMap of
             SRExecute -> do
@@ -410,7 +415,7 @@ handleEvent YMDnsConfig{..} event = case event of
                 use (lResolveMap . ownerLoad) >>= \ownLoad ->
                     -- resend heartbeat
                     sendMsgTo unicastSocket multicastAddress $ YMDnsHeartbeat ownLoad
-                void . liftIO . forkIO $ do
+                threadId <- liftIO . forkIO $ do
                     putText "Execution started"
                     (time, result) <- timeComputation $ do
                         threadDelay (seconds delay)
@@ -418,9 +423,18 @@ handleEvent YMDnsConfig{..} event = case event of
                     putText "Execution done, sending message"
                     sendMsgTo unicastSocket sender $
                         YMDnsTaskResponse $ Just $ TaskResponse time result
-                    writeChan eventChannel TaskFinished
+                    writeChan eventChannel $ TaskFinished tid
+                lWorkerTIDs %= M.insert tid threadId
             SRPass -> pass
             SRFail -> sendMsgTo unicastSocket sender $ YMDnsTaskResponse Nothing
+    MulticastMessage sender (YMDnsTaskCancel tid) -> do
+        threadIdM <- uses lWorkerTIDs $ M.lookup tid
+        whenJust threadIdM $ \threadId -> do
+            putText $ "CANCELING TASK " <> show tid
+            liftIO $ killThread threadId
+            lWorkerTIDs %= M.delete tid
+            sendMsgTo unicastSocket sender $ YMDnsTaskResponse Nothing
+            putText $ "TASK " <> show tid <> " CANCELED"
     MulticastMessage _ _ -> do
         fail "unexpected multicast message"
     ResendHeartbeat -> do
@@ -433,8 +447,9 @@ handleEvent YMDnsConfig{..} event = case event of
         lResolveMap %= resolveMapRemove address
         lHeartbeatTimers %= M.delete address
         use lResolveMap >>= \m -> putText ("current map: " <> show m)
-    TaskFinished -> do
+    TaskFinished tid -> do
         lResolveMap . ownerLoad -= 1
+        lWorkerTIDs %= M.delete tid
 
 -- | Function for spawning a producer in another thread
 serveProducer :: String -> Int -> IO ()
@@ -478,3 +493,14 @@ offloadTask t = withSocketsDo $ do
     case msg of
       YMDnsTaskResponse r -> pure r
       e                   -> panic ("Unknown response: " <> show e)
+
+cancelTask :: Word32 -> IO (Maybe TaskResponse)
+cancelTask tid = withSocketsDo $ do
+    udpSocket <- createUdpSocket
+
+    putText $ "Canceling the task #" <> show tid
+    sendMsgTo udpSocket multicastAddress $ YMDnsTaskCancel tid
+    (msg, _) <- recvMsgFrom udpSocket
+    case msg of
+        YMDnsTaskResponse r -> pure r
+        e                   -> panic ("Unknown response: " <> show e)
